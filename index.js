@@ -1,101 +1,93 @@
-import dotenv from 'dotenv';
-dotenv.config();
-import express from 'express';
-import bodyParser from 'body-parser';
-import cors from 'cors';
+/* ************************************************************ */
+/*  prayerScheduler.js  –  cron-based,  no headless burst       */
+/* ************************************************************ */
+import 'dotenv/config';
+import cron from 'node-cron';
 import Expo from 'expo-server-sdk';
-import { connectDatabase } from "./db_config.js";
-
-import PrayTime  from "./prayerTime.js";
+import PrayTime from './prayerTime.js';
 import Device_Token from './token_model.js';
-
+import { connectDatabase } from './db_config.js';
+import express from 'express';
 const app = express();
-app.use(cors());
-app.use(bodyParser.json());
-const expo = new Expo();
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+import cors from 'cors';
+app.use(cors({
+    origin: '*',
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization'],
+    optionsSuccessStatus: 200
+})); //
 
-/* ---------- utils ---------- */
+const route = express.Router()
+const expo = new Expo();
 const PRESET = { lat: 19.0760, lng: 72.8777, tz: 'Asia/Kolkata', method: 'MWL' };
 
+/* ---------- prayer calc (your original) ---------- */
 function calcPrayerTimes(date = new Date()) {
     const calc = new PrayTime(PRESET.method);
     calc.location([PRESET.lat, PRESET.lng]);
     calc.timezone(PRESET.tz);
     calc.format('24h');
-    let times = calc.getTimes(date);          // {fajr:'05:13', ...}
-    return times= {
-        ...times,
-        dhuhr: "10:45"
-    }
+    return calc.getTimes(date);
+    // const t = calc.getTimes(date);
+    // return { ...t, dhuhr: '11:18' };
 }
 
-/* ---------- daily scheduler ---------- */
-let lastScheduled = null;              // YYYY-MM-DD
+/* ---------- schedule ONE cron job per prayer per day ---------- */
+async function planDay(date) {
+    const times = calcPrayerTimes(date);
+    const prayers = Object.entries(times).filter(([p]) => !['sunrise', 'midnight'].includes(p));
+    const tokens = await Device_Token.find().lean();
+    const recipients = tokens.map((t) => t.expoPushToken).filter(Expo.isExpoPushToken);
 
-async function scheduleTodaysPrayers() {
-    const todayIST = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' }); // '2025-09-19'
-    if (lastScheduled === todayIST) return;          // already done today
-    const times = calcPrayerTimes(new Date());
-    const tokens = await Device_Token.find().lean().cursor(); // stream
-    const batch = [];                           // reusable buffer
+    if (!recipients.length) return;
 
-    for await (const doc of tokens) {
-        const tk = doc.expoPushToken;
-        if (!Expo.isExpoPushToken(tk)) continue;
+    for (const [prayer, time] of prayers) {
+        const [h, m] = time.split(':').map(Number);
+        console.log(prayer,'prayer');
+        if (['sunset','midnight',].includes(prayer)) continue; // skip unwanted prayers
+        /* ✓  CRON PATTERN – never pass Date object  */
+        const pattern = `${m} ${h} * * *`; // minute hour day month weekday
 
-        for (const [p, t] of Object.entries(times)) {
-            console.log(p, t, 'check the prayer time');
-            if (['sunrise', 'midnight'].includes(p)) {
-                continue; // Skip to the next iteration of the for loop
+        cron.schedule(pattern, async () => {
+            try {
+                const messages = recipients.map((tok) => ({
+                    to: tok,
+                    sound: 'azaan.wav',
+                    priority: 'high',
+                    channelId: 'prayer',
+                    data: { type: `${prayer}time`, prayer: prayer.toUpperCase(), time },
+                }));
+                const sendResult = await expo.sendPushNotificationsAsync(messages);
+                console.log(`[${new Date().toISOString()}] ${prayer} sent to ${messages.length} devices`, messages, sendResult);
+            } catch (e) {
+                console.log(JSON.stringify({ prayer, time, error: e.message, ts: new Date().toISOString() }) + '-------Error in Schedule------');
             }
-            const [h, m] = t.split(':').map(Number);
-            const fire = new Date();
-            fire.setHours(h, m, 5, 0);
-            const ttlSec = Math.max(0, Math.floor((fire - Date.now()) / 1000));
-            if (ttlSec <= 0) continue; // Prayer already past
-
-            batch.push({
-                to: tk,
-                data: { type: p + 'time', prayer: p.toUpperCase(), time: t },
-                priority: 'high',
-                channelId: 'prayer',
-                ttl: ttlSec,
-            });
-        }
+        }, { scheduled: true, timezone: 'Asia/Kolkata' });
     }
-
-
-    if (!batch.length) { lastScheduled = todayIST; return; }
-
-    /* ---- single HTTP call ---- */
-    await expo.sendPushNotificationsAsync(batch);
-    lastScheduled = todayIST;
-    console.log(`[PRAYER] queued ${batch.length} silent pushes for ${todayIST}`);
+    console.log(`[${date.toISOString().slice(0, 10)}]  ${prayers.length} prayers scheduled`);
 }
 
-/* ---------- retry wrapper ---------- */
-async function robustSchedule() {
-    try { await scheduleTodaysPrayers(); }
-    catch (e) {
-        console.error('[PRAYER] sched fail, retry in 30s', e.message);
-        setTimeout(robustSchedule, 30_000);
-    }
+/* ---------- plan today + tomorrow on start / midnight ---------- */
+async function bootstrapScheduler() {
+    /* midnight scheduler – plans tomorrow */
+    cron.schedule('0 0 * * *', async () => {
+        const tomorrow = new Date();
+        tomorrow.setDate(tomorrow.getDate() + 1);
+        await planDay(tomorrow);
+    }, { timezone: 'Asia/Kolkata' });
+
+    await planDay(new Date());                      // today
+    await planDay(new Date(Date.now() + 86_400_000)); // tomorrow
 }
 
-/* ---------- IST midnight alignment ---------- */
-function msToNextISTMidnight() {
-    const now = new Date();
-    const tomorrow = new Date(now.toLocaleString("en-US", { timeZone: "Asia/Kolkata" }));
-    tomorrow.setHours(24, 0, 5, 0);          // 00:00:05 IST
-    return tomorrow - now;
-}
-setTimeout(() => {
-    robustSchedule();
-    setInterval(robustSchedule, 86_400_000); // 24h
-}, msToNextISTMidnight());
+/* ---------- REST endpoints (your original) ---------- */
 
-/* ---------- REST – unchanged ---------- */
-app.post('/api/expotoken', async (req, res) => {
+
+
+
+route.post('/api/expotoken', async (req, res) => {
     try {
         const { username = 'test', token } = req.body;
         if (!token) return res.status(400).json({ error: 'token missing' });
@@ -105,18 +97,35 @@ app.post('/api/expotoken', async (req, res) => {
             { upsert: true }
         );
         res.json({ ok: true });
-    } catch (e) { res.json({ error: e.message }); }
+    } catch (e) {
+        res.json({ error: e.message });
+    }
 });
 
-/* ---------- boot ---------- */
-const PORT = process.env.PORT || 4000;
-app.listen(PORT, async () => {
-    await connectDatabase(process.env.DBURL).then(async () => {
-        console.log('MongoDB connected');
-        await robustSchedule();        // in-case we restarted during the day
-        console.log(`🚀 Expo-push server on ${PORT}`);
-    }).catch((err) => {
-        console.error('MongoDB connection error:', err);
-        process.exit(1); // Exit the application if the database connection fails
-    });   
+route.get('/api/expotoken', async (req, res) => {
+    try {
+       const data = await Device_Token.find(
+            {}
+        );
+        res.json({ ok: true, data, count: data.length });
+    } catch (e) {
+        res.json({ error: e.message });
+    }
 });
+
+const PORT = process.env.PORT || 4000;
+app.listen(PORT,async () =>{
+    try {
+        await connectDatabase(process.env.DBURL).then(async () => {
+            console.log('DB connection successful');
+            await bootstrapScheduler(); // <-- schedule AFTER db is ready
+            console.log(`🚀 Expo-push server on ${PORT}`)});
+        } catch (err) {
+            console.log('Database connection failed', err);
+            process.exit(1);
+        }
+    });
+
+app.use('/.netlify/functions/api', route);
+
+export default app;
