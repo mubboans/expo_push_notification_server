@@ -4,6 +4,7 @@ export async function connectDatabase(dbUrl) {
     mg.connect(dbUrl, {
         useNewUrlParser: true,
         useUnifiedTopology: true,
+        serverSelectionTimeoutMS: 20000, 
     }).then(() => {
         console.log('Connected to MongoDB Atlas' + dbUrl);
     }).catch((error) => {

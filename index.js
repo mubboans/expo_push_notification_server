@@ -87,7 +87,7 @@ async function bootstrapScheduler() {
 
 
 
-route.post('/api/expotoken', async (req, res) => {
+route.post('/expotoken', async (req, res) => {
     try {
         const { username = 'test', token } = req.body;
         if (!token) return res.status(400).json({ error: 'token missing' });
@@ -102,18 +102,20 @@ route.post('/api/expotoken', async (req, res) => {
     }
 });
 
-route.get('/api/expotoken', async (req, res) => {
+route.get('/expotoken', async (req, res) => {
     try {
-       const data = await Device_Token.find(
-            {}
-        );
+       const data = await Device_Token.find().lean();
         res.json({ ok: true, data, count: data.length });
     } catch (e) {
         res.json({ error: e.message });
     }
 });
+route.get('/', (req, res) => {
+    res.send('Expo-push server is running');
+});
 
 const PORT = process.env.PORT || 4000;
+// app.use(route);
 app.listen(PORT,async () =>{
     try {
         await connectDatabase(process.env.DBURL).then(async () => {
@@ -125,7 +127,6 @@ app.listen(PORT,async () =>{
             process.exit(1);
         }
     });
-
 app.use('/.netlify/functions/api', route);
 
 export default app;
