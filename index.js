@@ -104,7 +104,8 @@ route.post('/expotoken', async (req, res) => {
 
 route.get('/expotoken', async (req, res) => {
     try {
-       const data = await Device_Token.find().lean();
+        const query = req?.query || {};
+        const data = await Device_Token.find(query).lean();
         res.json({ ok: true, data, count: data.length });
     } catch (e) {
         res.json({ error: e.message });

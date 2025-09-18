@@ -1,7 +1,7 @@
 import mg from 'mongoose';
 export async function connectDatabase(dbUrl) {
     console.log('Connecting to MongoDB Atlas...');
-    mg.connect(dbUrl, {
+    await mg.connect(dbUrl, {
         useNewUrlParser: true,
         useUnifiedTopology: true,
         serverSelectionTimeoutMS: 20000, 
