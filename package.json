@@ -4,7 +4,8 @@
   "main": "index.js",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
-    "start": "node index.js"
+    "start": "node index.js",
+    "dev": "nodemon index.js"
   },
   "keywords": [],
   "author": "",
@@ -14,8 +15,8 @@
     "body-parser": "^2.2.0",
     "cors": "^2.8.5",
     "dotenv": "^17.2.2",
-    "expo-server-sdk": "^2.3.3",
     "express": "^5.1.0",
+    "firebase-admin": "^13.6.0",
     "mongoose": "^8.18.1",
     "node-cron": "^4.2.1",
     "qrcode-terminal": "^0.12.0",
