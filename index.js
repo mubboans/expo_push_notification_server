@@ -82,12 +82,12 @@ function log(level, message, data = {}) {
     };
 
     if (level === 'ERROR') {
-        console.error(JSON.stringify(logEntry));
+        // console.error(JSON.stringify(logEntry));
         stats.errors.push({ ...logEntry, time: timestamp });
         // Keep only last 100 errors
         if (stats.errors.length > 100) stats.errors.shift();
     } else {
-        console.log(JSON.stringify(logEntry));
+        // console.log(JSON.stringify(logEntry));
     }
 }
 
@@ -379,123 +379,138 @@ async function sendFCMBatch(tokenDocs, prayer, time) {
     return results;
 }
 
-/**
- * Check and send prayer notification if time matches
- */
-async function checkPrayerTimesAndNotify() {
-    try {
-        const now = new Date();
-        const dateStr = getDateString(now);
-        const currentTime = getCurrentTime();
 
-        // Get prayer times for today
-        const prayerTimes = getPrayerTimes(now);
-
-        if (!prayerTimes) {
-            log('WARN', 'Prayer times not available', { date: dateStr });
-            return;
-        }
-
-        // Check each prayer
-        for (const [prayer, time] of Object.entries(prayerTimes)) {
-            // Check if current time matches prayer time
-            if (currentTime === time) {
-
-                // Check if already sent today
-                const notificationKey = `${dateStr}:${prayer}`;
-                if (cache.sentNotifications.has(notificationKey)) {
-                    continue; // Already sent
-                }
-
-                log('INFO', 'Time match found, triggering notification', {
-                    prayer,
-                    time,
-                    date: dateStr
-                });
-
-                // Get tokens
-                const tokenDocs = await getTokens();
-
-                if (tokenDocs.length === 0) {
-                    log('WARN', 'No tokens available for notification', { prayer });
-                    continue;
-                }
-
-                // Send notifications
-                const results = await sendFCMBatch(tokenDocs, prayer, time);
-
-                // Update stats
-                stats.notificationsSent += results.success;
-                stats.notificationsFailed += results.failed;
-                stats.lastNotificationTime = new Date();
-
-                // Mark as sent
-                cache.sentNotifications.add(notificationKey);
-
-                log('INFO', 'Prayer notification cycle completed', {
-                    prayer,
-                    time,
-                    totalTokens: tokenDocs.length,
-                    success: results.success,
-                    failed: results.failed
-                });
-            }
-        }
-
-    } catch (error) {
-        log('ERROR', 'Failed in prayer check cycle', {
-            error: error.message,
-            stack: error.stack
-        });
-    }
-}
 
 /* ==================== SCHEDULER SETUP ==================== */
 
+// Store active cron jobs for the day so we can clear them at midnight
+let currentDayJobs = [];
+
+/**
+ * Schedule specific cron jobs for today's prayers
+ */
+function scheduleTodayPrayers() {
+    // 1. Clear existing jobs from yesterday/previous run
+    currentDayJobs.forEach(job => job.stop());
+    currentDayJobs = [];
+
+    const now = new Date();
+    const dateStr = getDateString(now);
+
+    // Get prayer times
+    const prayerTimes = getPrayerTimes(now);
+
+    if (!prayerTimes) {
+        log('WARN', 'Could not fetch prayer times for scheduling', { date: dateStr });
+        return;
+    }
+
+    log('INFO', 'Scheduling prayers for today', { date: dateStr, times: prayerTimes });
+
+    // 2. Schedule a job for each prayer
+    Object.entries(prayerTimes).forEach(([prayer, time]) => {
+        const [hour, minute] = time.split(':');
+
+        // Check if time is in the past
+        const prayerDate = new Date();
+        // We need to be careful with timezone here. 
+        // The server might be in UTC, but 'time' is in Asia/Kolkata.
+        // Simple comparison:
+        // Get current time in Asia/Kolkata
+        const nowInTZ = new Date(new Date().toLocaleString('en-US', { timeZone: PRESET.tz }));
+        const pDate = new Date(nowInTZ);
+        pDate.setHours(parseInt(hour), parseInt(minute), 0, 0);
+
+        // If it's passed, don't schedule.
+        if (pDate <= nowInTZ) {
+            // log('DEBUG', 'Skipping past prayer', { prayer, time });
+            return;
+        }
+
+        // Schedule the specific cron task
+        // Format: "minute hour * * *"
+        // Note: node-cron uses server time by default, but we can pass timezone!
+        const cronExpression = `${parseInt(minute)} ${parseInt(hour)} * * *`;
+
+        const job = cron.schedule(cronExpression, async () => {
+            log('INFO', 'Scheduled prayer task triggered', { prayer, time });
+
+            // Double check tokens are fresh.
+            const tokenDocs = await getTokens();
+
+            if (tokenDocs.length === 0) {
+                log('WARN', 'No tokens available for notification', { prayer });
+                return;
+            }
+
+            const results = await sendFCMBatch(tokenDocs, prayer, time);
+
+            // Update stats
+            stats.notificationsSent += results.success;
+            stats.notificationsFailed += results.failed;
+            stats.lastNotificationTime = new Date();
+
+            // Log completion
+            log('INFO', 'Scheduled notification cycle completed', {
+                prayer,
+                time,
+                success: results.success,
+                failed: results.failed
+            });
+
+        }, {
+            timezone: PRESET.tz
+        });
+
+        currentDayJobs.push(job);
+        log('INFO', 'Scheduled notification', { prayer, time, expression: cronExpression });
+    });
+
+    log('INFO', `Scheduled ${currentDayJobs.length} notifications for rest of the day`);
+}
+
+/**
+ * Initialize the prayer notification scheduler
+ */
+/**
+ * Initialize the prayer notification scheduler
+ */
 /**
  * Initialize the prayer notification scheduler
  */
 async function initializeScheduler() {
     log('INFO', 'Initializing prayer notification scheduler');
 
-    // Update prayer times cache
+    // Update caches immediately on start
     updatePrayerTimesCache();
-
-    // Update token cache
     await updateTokenCache();
 
-    // Schedule midnight cache refresh
-    cron.schedule('0 0 * * *', () => {
-        log('INFO', 'Midnight cache refresh triggered');
+    // 1. Schedule notifications for TODAY immediately 
+    // (Handles server restart in middle of day)
+    scheduleTodayPrayers();
+
+    // 2. MASTER CRON: Runs at Midnight (00:00) 
+    // Responsible for maintenance and scheduling tomorrow's tasks
+    cron.schedule('0 0 * * *', async () => {
+        log('INFO', 'Midnight Master Job triggered');
+
+        // Refresh Prayer Times Cache
         updatePrayerTimesCache();
 
-        // Clear sent notifications for previous day
-        const yesterday = new Date();
-        yesterday.setDate(yesterday.getDate() - 1);
-        const yesterdayStr = getDateString(yesterday);
+        // Cleanup Sent Notifications History
+        cache.sentNotifications.clear();
+        log('INFO', 'Sent notifications cache cleared');
 
-        cache.sentNotifications.forEach(key => {
-            if (key.startsWith(yesterdayStr)) {
-                cache.sentNotifications.delete(key);
-            }
-        });
+        // Schedule timings for the new day
+        scheduleTodayPrayers();
 
-        log('INFO', 'Sent notifications cache cleaned');
     }, {
         timezone: PRESET.tz
     });
 
-    // Schedule token cache refresh every 5 minutes
+    // 3. Token Cache Refresh (Runs every 5 minutes)
     cron.schedule('*/5 * * * *', async () => {
         await updateTokenCache();
-    }, {
-        timezone: PRESET.tz
-    });
-
-    // MAIN CRON: Run every minute to check for prayer times
-    cron.schedule('* * * * *', async () => {
-        // log('DEBUG', 'Running minute check', { time: getCurrentTime() });
-        await checkPrayerTimesAndNotify();
     }, {
         timezone: PRESET.tz
     });
@@ -503,7 +518,7 @@ async function initializeScheduler() {
     log('INFO', 'Prayer notification scheduler initialized', {
         prayers: PRAYER_NAMES,
         timezone: PRESET.tz,
-        todayTimes: cache.prayerTimes.today
+        type: 'Dynamic Daily Scheduling'
     });
 }
 
