@@ -3,9 +3,9 @@
 /*  Features: Caching, Batching, Error Handling, Monitoring     */
 /* ************************************************************ */
 import 'dotenv/config';
-import cron from 'node-cron';
+// import cron from 'node-cron'; // Removed for GitHub Actions migration
 import PrayTime from './prayerTime.js';
-import { FCM_DEVICE_TOKEN, NotificationHistory } from './token_model.js';
+import { FCM_DEVICE_TOKEN, NotificationHistory, Device_Token, NotificationQueue } from './token_model.js';
 import { connectDatabase } from './db_config.js';
 import express from 'express';
 import admin from 'firebase-admin';
@@ -13,12 +13,26 @@ import { createRequire } from 'module';
 import cors from 'cors';
 
 const require = createRequire(import.meta.url);
-const serviceAccount = require('./serviceAccountKey.json');
+// const serviceAccount = require('./serviceAccountKey.json');
+
+let serviceAccount;
+if (process.env.FIREBASE_SERVICE_ACCOUNT_JSON) {
+    try {
+        serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_JSON);
+    } catch (err) {
+        console.error('Invalid FIREBASE_SERVICE_ACCOUNT_JSON:', err.message);
+        process.exit(1);
+    }
+} else {
+    // fallback to file if present in repo/deployment (not recommended for public repo)
+    serviceAccount = require('./serviceAccountKey.json');
+}
 
 // Initialize Firebase Admin
 admin.initializeApp({
     credential: admin.credential.cert(serviceAccount)
 });
+
 
 const app = express();
 app.use(express.json());
@@ -383,148 +397,245 @@ async function sendFCMBatch(tokenDocs, prayer, time) {
 
 /* ==================== SCHEDULER SETUP ==================== */
 
-// Store active cron jobs for the day so we can clear them at midnight
-let currentDayJobs = [];
-
-/**
- * Schedule specific cron jobs for today's prayers
- */
-function scheduleTodayPrayers() {
-    // 1. Clear existing jobs from yesterday/previous run
-    currentDayJobs.forEach(job => job.stop());
-    currentDayJobs = [];
-
-    const now = new Date();
-    const dateStr = getDateString(now);
-
-    // Get prayer times
-    const prayerTimes = getPrayerTimes(now);
-
-    if (!prayerTimes) {
-        log('WARN', 'Could not fetch prayer times for scheduling', { date: dateStr });
-        return;
-    }
-
-    log('INFO', 'Scheduling prayers for today', { date: dateStr, times: prayerTimes });
-
-    // 2. Schedule a job for each prayer
-    Object.entries(prayerTimes).forEach(([prayer, time]) => {
-        const [hour, minute] = time.split(':');
-
-        // Check if time is in the past
-        const prayerDate = new Date();
-        // We need to be careful with timezone here. 
-        // The server might be in UTC, but 'time' is in Asia/Kolkata.
-        // Simple comparison:
-        // Get current time in Asia/Kolkata
-        const nowInTZ = new Date(new Date().toLocaleString('en-US', { timeZone: PRESET.tz }));
-        const pDate = new Date(nowInTZ);
-        pDate.setHours(parseInt(hour), parseInt(minute), 0, 0);
-
-        // If it's passed, don't schedule.
-        if (pDate <= nowInTZ) {
-            // log('DEBUG', 'Skipping past prayer', { prayer, time });
-            return;
-        }
-
-        // Schedule the specific cron task
-        // Format: "minute hour * * *"
-        // Note: node-cron uses server time by default, but we can pass timezone!
-        const cronExpression = `${parseInt(minute)} ${parseInt(hour)} * * *`;
-
-        const job = cron.schedule(cronExpression, async () => {
-            log('INFO', 'Scheduled prayer task triggered', { prayer, time });
-
-            // Double check tokens are fresh.
-            const tokenDocs = await getTokens();
-
-            if (tokenDocs.length === 0) {
-                log('WARN', 'No tokens available for notification', { prayer });
-                return;
-            }
-
-            const results = await sendFCMBatch(tokenDocs, prayer, time);
-
-            // Update stats
-            stats.notificationsSent += results.success;
-            stats.notificationsFailed += results.failed;
-            stats.lastNotificationTime = new Date();
-
-            // Log completion
-            log('INFO', 'Scheduled notification cycle completed', {
-                prayer,
-                time,
-                success: results.success,
-                failed: results.failed
-            });
-
-        }, {
-            timezone: PRESET.tz
-        });
-
-        currentDayJobs.push(job);
-        log('INFO', 'Scheduled notification', { prayer, time, expression: cronExpression });
-    });
-
-    log('INFO', `Scheduled ${currentDayJobs.length} notifications for rest of the day`);
-}
-
-/**
- * Initialize the prayer notification scheduler
- */
-/**
- * Initialize the prayer notification scheduler
- */
-/**
- * Initialize the prayer notification scheduler
- */
-async function initializeScheduler() {
-    log('INFO', 'Initializing prayer notification scheduler');
-
-    // Update caches immediately on start
-    updatePrayerTimesCache();
-    await updateTokenCache();
-
-    // 1. Schedule notifications for TODAY immediately 
-    // (Handles server restart in middle of day)
-    scheduleTodayPrayers();
-
-    // 2. MASTER CRON: Runs at Midnight (00:00) 
-    // Responsible for maintenance and scheduling tomorrow's tasks
-    cron.schedule('0 0 * * *', async () => {
-        log('INFO', 'Midnight Master Job triggered');
-
-        // Refresh Prayer Times Cache
-        updatePrayerTimesCache();
-
-        // Cleanup Sent Notifications History
-        cache.sentNotifications.clear();
-        log('INFO', 'Sent notifications cache cleared');
-
-        // Schedule timings for the new day
-        scheduleTodayPrayers();
-
-    }, {
-        timezone: PRESET.tz
-    });
-
-    // 3. Token Cache Refresh (Runs every 5 minutes)
-    cron.schedule('*/5 * * * *', async () => {
-        await updateTokenCache();
-    }, {
-        timezone: PRESET.tz
-    });
-
-    log('INFO', 'Prayer notification scheduler initialized', {
-        prayers: PRAYER_NAMES,
-        timezone: PRESET.tz,
-        type: 'Dynamic Daily Scheduling'
-    });
-}
+// Internal scheduler removed in favor of GitHub Actions cron (scripts/cron.js)
+// See .github/workflows/cron_run_script.yml
 
 /* ==================== REST API ENDPOINTS ==================== */
 
+/* ==================== REST API HELPER ==================== */
+
+const sendResponse = (res, success, data = null, message = null, pagination = null) => {
+    const response = { ok: success };
+    if (data) response.data = data;
+    if (message) response[success ? 'message' : 'error'] = message;
+    if (pagination) response.pagination = pagination;
+    return res.status(success ? 200 : 500).json(response);
+};
+
+/* ==================== CRUD API ENDPOINTS ==================== */
+
+// --- 1. Expo Device Tokens (Device_Token) ---
+
+route.get('/api/expo-tokens', async (req, res) => {
+    try {
+        const page = parseInt(req.query.page) || 1;
+        const limit = parseInt(req.query.limit) || 20;
+        const skip = (page - 1) * limit;
+
+        const tokens = await Device_Token.find()
+            .sort({ createdAt: -1 })
+            .skip(skip)
+            .limit(limit)
+            .lean();
+
+        const count = await Device_Token.countDocuments();
+
+        sendResponse(res, true, tokens, null, {
+            total: count,
+            page,
+            limit,
+            pages: Math.ceil(count / limit)
+        });
+    } catch (error) {
+        log('ERROR', 'Failed to fetch expo tokens', { error: error.message });
+        sendResponse(res, false, null, error.message);
+    }
+});
+
+route.post('/api/expo-tokens', async (req, res) => {
+    try {
+        const { token, username } = req.body;
+        if (!token) return sendResponse(res, false, null, 'Token is required');
+
+        const result = await Device_Token.findOneAndUpdate(
+            { expoPushToken: token },
+            { expoPushToken: token, username },
+            { upsert: true, new: true }
+        );
+
+        sendResponse(res, true, result, 'Expo token registered successfully');
+    } catch (error) {
+        log('ERROR', 'Failed to register expo token', { error: error.message });
+        sendResponse(res, false, null, error.message);
+    }
+});
+
+route.delete('/api/expo-tokens/:id', async (req, res) => {
+    try {
+        const { id } = req.params;
+        await Device_Token.findByIdAndDelete(id);
+        sendResponse(res, true, null, 'Expo token deleted successfully');
+    } catch (error) {
+        sendResponse(res, false, null, error.message);
+    }
+});
+
+
+// --- 2. FCM Device Tokens (FCM_DEVICE_TOKEN) ---
+
+route.get('/api/fcm-tokens', async (req, res) => {
+    try {
+        const page = parseInt(req.query.page) || 1;
+        const limit = parseInt(req.query.limit) || 20;
+        const skip = (page - 1) * limit;
+
+        const tokens = await FCM_DEVICE_TOKEN.find()
+            .sort({ createdAt: -1 })
+            .skip(skip)
+            .limit(limit)
+            .lean();
+
+        const count = await FCM_DEVICE_TOKEN.countDocuments();
+
+        sendResponse(res, true, tokens, null, {
+            total: count,
+            page,
+            limit,
+            pages: Math.ceil(count / limit)
+        });
+    } catch (error) {
+        log('ERROR', 'Failed to fetch fcm tokens', { error: error.message });
+        sendResponse(res, false, null, error.message);
+    }
+});
+
+route.post('/api/fcm-tokens', async (req, res) => {
+    try {
+        const { token, platform, username } = req.body;
+        if (!token) return sendResponse(res, false, null, 'Token is required');
+
+        const result = await FCM_DEVICE_TOKEN.findOneAndUpdate(
+            { fcmToken: token },
+            { fcmToken: token, platform, username },
+            { upsert: true, new: true }
+        );
+
+        // Invalidate cache
+        cache.tokens.lastUpdated = null;
+
+        sendResponse(res, true, result, 'FCM token registered successfully');
+    } catch (error) {
+        log('ERROR', 'Failed to register fcm token', { error: error.message });
+        sendResponse(res, false, null, error.message);
+    }
+});
+
+route.delete('/api/fcm-tokens/:id', async (req, res) => {
+    try {
+        const { id } = req.params;
+        await FCM_DEVICE_TOKEN.findByIdAndDelete(id);
+        cache.tokens.lastUpdated = null;
+        sendResponse(res, true, null, 'FCM token deleted successfully');
+    } catch (error) {
+        sendResponse(res, false, null, error.message);
+    }
+});
+
+
+// --- 3. Notification History (NotificationHistory) ---
+
+route.get('/api/history', async (req, res) => {
+    try {
+        const page = parseInt(req.query.page) || 1;
+        const limit = parseInt(req.query.limit) || 50;
+        const skip = (page - 1) * limit;
+        const { status, prayer } = req.query;
+
+        const query = {};
+        if (status) query.status = status;
+        if (prayer) query.prayer = prayer;
+
+        const history = await NotificationHistory.find(query)
+            .sort({ sentAt: -1 })
+            .skip(skip)
+            .limit(limit)
+            .lean();
+
+        const count = await NotificationHistory.countDocuments(query);
+
+        sendResponse(res, true, history, null, {
+            total: count,
+            page,
+            limit,
+            pages: Math.ceil(count / limit)
+        });
+    } catch (error) {
+        log('ERROR', 'Failed to fetch history', { error: error.message });
+        sendResponse(res, false, null, error.message);
+    }
+});
+
+route.delete('/api/history/clear', async (req, res) => {
+    try {
+        // Clear history older than 30 days
+        const date = new Date();
+        date.setDate(date.getDate() - 30);
+
+        const result = await NotificationHistory.deleteMany({ sentAt: { $lt: date } });
+        sendResponse(res, true, { deletedCount: result.deletedCount }, 'Old history cleared');
+    } catch (error) {
+        sendResponse(res, false, null, error.message);
+    }
+});
+
+route.delete('/api/history/:id', async (req, res) => {
+    try {
+        const { id } = req.params;
+        await NotificationHistory.findByIdAndDelete(id);
+        sendResponse(res, true, null, 'History log deleted successfully');
+    } catch (error) {
+        sendResponse(res, false, null, error.message);
+    }
+});
+
+
+// --- 4. Notification Queue (NotificationQueue) ---
+
+route.get('/api/queue', async (req, res) => {
+    try {
+        const page = parseInt(req.query.page) || 1;
+        const limit = parseInt(req.query.limit) || 50;
+        const skip = (page - 1) * limit;
+        const { status } = req.query;
+
+        const query = {};
+        if (status) query.status = status;
+
+        const queue = await NotificationQueue.find(query)
+            .sort({ scheduledAt: 1 })
+            .skip(skip)
+            .limit(limit)
+            .lean();
+
+        const count = await NotificationQueue.countDocuments(query);
+
+        sendResponse(res, true, queue, null, {
+            total: count,
+            page,
+            limit,
+            pages: Math.ceil(count / limit)
+        });
+    } catch (error) {
+        log('ERROR', 'Failed to fetch queue', { error: error.message });
+        sendResponse(res, false, null, error.message);
+    }
+});
+
+route.delete('/api/queue/:id', async (req, res) => {
+    try {
+        const { id } = req.params;
+        await NotificationQueue.findByIdAndDelete(id);
+        sendResponse(res, true, null, 'Queue item deleted successfully');
+    } catch (error) {
+        sendResponse(res, false, null, error.message);
+    }
+});
+
+
+// --- Legacy Endpoints (Maintained for backward compatibility but using new helpers where possible) ---
+
 route.post('/pushfcmtoken', async (req, res) => {
+    // Legacy endpoint: redirects to logic of POST /api/fcm-tokens but keeps old response format if needed
     try {
         const { platform = 'none', token } = req.body;
         if (!token) {
@@ -535,10 +646,7 @@ route.post('/pushfcmtoken', async (req, res) => {
             { platform, fcmToken: token },
             { upsert: true }
         );
-
-        // Invalidate token cache to pick up new token immediately on next refresh
         cache.tokens.lastUpdated = null;
-
         log('INFO', 'FCM Token registered', { platform, token });
         res.status(200).json({ ok: true, message: 'FCM Token registered successfully' })
     } catch (error) {
@@ -559,6 +667,25 @@ route.get('/fcmtoken', async (req, res) => {
 });
 
 route.get('/history', async (req, res) => {
+    // Mapping old /history to something similar, or just keeping it. 
+    // The user asked for optimization. I will replace the logic of this one 
+    // to use the new implementation style or just leave it if they use it differently.
+    // The old one accepted limit and status.
+    // Let's forward it to the new logic but keeping response format if strict compatibility needed.
+    // However, the instructions were "create me crud apis".
+    // I will leave the OLD ones as they were to avoid breaking existing clients 
+    // unless the user explicitly said "replace". 
+    // I'll leave them below as they were, but I've already overwritten them in the file content 
+    // because I am replacing the block. 
+    // Wait, I am replacing a block of code. I should probably rewrite them or 
+    // if I want to keep them, I should include them in the replacement content.
+
+    // I will iterate on the replacement chunk to ensure I don't delete them if not intended.
+    // But since I am providing NEW /api/... endpoints, having duplicate logic is redundant.
+    // I will keep the legacy endpoints as redirect wrappers or just independent implementations 
+    // for safety.
+
+    // START LEGACY IMPLEMENTATION RE-INCLUSION
     try {
         const { limit = 100, status } = req.query;
         const query = {};
@@ -760,7 +887,16 @@ app.listen(PORT, async () => {
         await connectDatabase(process.env.DBURL);
         log('INFO', 'Database connection successful');
 
-        await initializeScheduler();
+        if (!process.env.DISABLE_SCHEDULER || process.env.DISABLE_SCHEDULER === 'false') {
+            // await initializeScheduler(); 
+            // Scheduler disabled in favor of GitHub Actions
+            log('INFO', 'Internal scheduler disabled (using GitHub Actions)');
+            // Still initialize caches one time
+            updatePrayerTimesCache();
+            await updateTokenCache();
+        } else {
+            log('INFO', 'Scheduler explicitly disabled via DISABLE_SCHEDULER');
+        }
 
         log('INFO', 'Server started', {
             port: PORT,
