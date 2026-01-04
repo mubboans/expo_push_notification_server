@@ -1,0 +1,31 @@
+name: Scheduled Cron (run script)
+
+on:
+  schedule:
+    # runs every minute. You can change to '*/5 * * * *' if you prefer every 5 minutes,
+    # but then you may miss exact HH:MM matches. Using every minute is recommended.
+    - cron: '*/1 * * * *'
+  workflow_dispatch:
+
+jobs:
+  run-cron-script:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 18
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run scheduled notification script
+        env:
+          DBURL: ${{ secrets.DBURL }}
+          # Either commit serviceAccountKey.json in the repo (not recommended) OR set the JSON as a secret:
+          FIREBASE_SERVICE_ACCOUNT_JSON: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_JSON }}
+          # If you prefer using a file in the repo, remove the above env and ensure serviceAccountKey.json exists.
+        run: node scripts/cron.js
