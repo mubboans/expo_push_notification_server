@@ -38,4 +38,5 @@ yarn-error.*
 
 app-example
 
-serviceAccountKey.json.env
+serviceAccountKey.json
+.env
