@@ -10,6 +10,8 @@ on:
 jobs:
   run-cron-script:
     runs-on: ubuntu-latest
+    env:
+      TZ: Asia/Kolkata
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
